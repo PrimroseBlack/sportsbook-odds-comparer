@@ -1,0 +1,343 @@
+//@version=5
+// BTC 15m Close Probability (Pine-style port of btc-15m-probability.ts)
+// -----------------------------------------------------------------------------
+// Paste into Webull's Script Editor (or TradingView). Use it on a 1-minute
+// BTC chart (any timeframe that divides 15 works).
+//
+// At the start of each 15-minute candle the TARGET is set to that candle's open
+// (or to your override). Every tick, it estimates P(15m candle closes ABOVE /
+// BELOW target) from:
+//   volatility (EWMA + Parkinson) x sqrt(time left)
+//   slope (linear regression x R^2), volume (relative volume + up/down volume delta),
+//   market structure (HH/HL vs LH/LL + break of structure),
+//   pivots / S&R (1D, 4h, 1h floor pivots, prev 15m high/low, swing pivots, custom level).
+// Support and resistance reflect part of the probability mass ("rejection").
+// A resistance between price and target lowers P(above). A support between
+// price and target lowers P(below).
+//
+// Difference from the .ts engine: this version uses the NEAREST level cluster
+// on each side, with an exact closed-form formula. The .ts engine reflects off
+// every level on a grid.
+//
+// Not financial advice.
+// -----------------------------------------------------------------------------
+indicator("BTC 15m Close Probability", shorttitle="BTC15 Prob", overlay=true, max_bars_back=500, max_lines_count=50, max_labels_count=50)
+
+// ---------------- Inputs ----------------
+intervalMin   = input.int(15, "Interval (minutes)", minval=1)
+targetOvr     = input.float(0.0, "Target override (0 = interval open)")
+slopeLen      = input.int(20, "Slope / volume-delta lookback (bars)", minval=3)
+volLen        = input.int(60, "Volatility lookback (bars)", minval=5)
+ewmaLambda    = input.float(0.94, "EWMA lambda", minval=0.5, maxval=0.999)
+volAvgLen     = input.int(50, "Average volume lookback (bars)", minval=5)
+recentVolLen  = input.int(5, "Recent volume bars", minval=1)
+swingK        = input.int(3, "Swing pivot strength (bars each side)", minval=1)
+touchLen      = input.int(240, "Level touch lookback (bars)", minval=10, maxval=480)
+driftShrink   = input.float(0.25, "Slope weight", step=0.05)
+maxDriftSig   = input.float(0.5, "Max drift (sigmas of remaining move)", step=0.05)
+volDeltaW     = input.float(0.08, "Volume-delta weight", step=0.01)
+structW       = input.float(0.06, "Market-structure weight", step=0.01)
+levelStrength = input.float(1.0, "Level strength (0 = ignore S/R)", step=0.1)
+maxHold       = input.float(0.45, "Max hold probability per level", step=0.05)
+useD          = input.bool(true, "Use 1D pivots")
+use4h         = input.bool(true, "Use 4h pivots")
+use1h         = input.bool(true, "Use 1h pivots")
+usePrev15     = input.bool(true, "Use previous 15m high/low")
+useSwings     = input.bool(true, "Use swing highs/lows")
+customLvl     = input.float(0.0, "Custom level (0 = none)")
+customStr     = input.float(0.2, "Custom level strength", step=0.05)
+drawLevels    = input.bool(true, "Draw target and nearest S/R")
+
+// ---------------- Helpers ----------------
+f_clamp(x, lo, hi) => math.max(lo, math.min(hi, x))
+
+// Standard normal CDF, Abramowitz & Stegun 7.1.26
+f_ncdf(z) =>
+    t = 1.0 / (1.0 + 0.3275911 * math.abs(z) / math.sqrt(2.0))
+    poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+    e = 1.0 - poly * math.exp(-(z * z) / 2.0)
+    z >= 0 ? 0.5 * (1.0 + e) : 0.5 * (1.0 - e)
+
+// ---------------- Time and target ----------------
+barMin     = timeframe.in_seconds() / 60.0
+intervalMs = intervalMin * 60000
+intStart   = math.floor(time / intervalMs) * intervalMs
+intEnd     = intStart + intervalMs
+nowMs      = barstate.isrealtime ? timenow : time_close
+secLeft    = math.max((intEnd - nowMs) / 1000.0, 1.0)
+T          = secLeft / 60.0
+newInt     = na(intStart[1]) or intStart != intStart[1]
+
+var float intOpen = na
+var float curHi = na
+var float curLo = na
+var float prevHi = na
+var float prevLo = na
+if newInt
+    prevHi := curHi
+    prevLo := curLo
+    intOpen := open
+    curHi := high
+    curLo := low
+else
+    curHi := math.max(curHi, high)
+    curLo := math.min(curLo, low)
+target = targetOvr > 0 ? targetOvr : intOpen
+
+// ---------------- Volatility ----------------
+r = math.log(close / close[1])
+var float ewVar = na
+if not na(r)
+    ewVar := na(ewVar) ? r * r : ewmaLambda * ewVar + (1 - ewmaLambda) * r * r
+hl      = math.log(high / low)
+parkVar = ta.sma(hl * hl, volLen) / (4 * math.log(2))
+sigBar  = math.max(math.sqrt(0.5 * nz(ewVar) + 0.5 * nz(parkVar)), 0.00005)
+sigMin  = sigBar / math.sqrt(barMin)
+sRem    = sigMin * math.sqrt(T)
+
+// ---------------- Slope (regression on log price) ----------------
+f_regress(len) =>
+    float sy = 0.0
+    for i = 0 to len - 1
+        sy += math.log(close[i])
+    yMean = sy / len
+    xMean = (len - 1) / 2.0
+    float sxy = 0.0
+    float sxx = 0.0
+    float syy = 0.0
+    for i = 0 to len - 1
+        dx = (len - 1 - i) - xMean
+        dy = math.log(close[i]) - yMean
+        sxy += dx * dy
+        sxx += dx * dx
+        syy += dy * dy
+    slp = sxx > 0 ? sxy / sxx : 0.0
+    rsq = sxx > 0 and syy > 0 ? (sxy * sxy) / (sxx * syy) : 0.0
+    [slp, rsq]
+[slopeBar, r2] = f_regress(slopeLen)
+slopeMin = slopeBar / barMin
+
+// ---------------- Volume ----------------
+avgVol    = ta.sma(volume[recentVolLen], volAvgLen)
+relVol    = avgVol > 0 ? ta.sma(volume, recentVolLen) / avgVol : 1.0
+sumVol    = math.sum(volume, slopeLen)
+signedVol = math.sum(close > open ? volume : close < open ? -volume : 0.0, slopeLen)
+volDelta  = sumVol > 0 ? signedVol / sumVol : 0.0
+volConf   = f_clamp(math.sqrt(relVol), 0.6, 1.5)
+
+// ---------------- Market structure ----------------
+ph = ta.pivothigh(high, swingK, swingK)
+pl = ta.pivotlow(low, swingK, swingK)
+var float shA = na
+var float shB = na
+var float shC = na
+var float slA = na
+var float slB = na
+var float slC = na
+if not na(ph)
+    shC := shB
+    shB := shA
+    shA := ph
+if not na(pl)
+    slC := slB
+    slB := slA
+    slA := pl
+float structScore = 0.0
+string structTxt = "insufficient swings"
+if not na(shB) and not na(slB)
+    hh = shA > shB
+    hlw = slA > slB
+    structScore := (hh ? 0.5 : -0.5) + (hlw ? 0.5 : -0.5)
+    structTxt := hh and hlw ? "uptrend HH/HL" : (not hh and not hlw) ? "downtrend LH/LL" : "range/mixed"
+    if close > shA
+        structScore += 0.5
+        structTxt += " +BOS up"
+    else if close < slA
+        structScore -= 0.5
+        structTxt += " +BOS down"
+structScore := f_clamp(structScore, -1.0, 1.0)
+
+// ---------------- Drift ----------------
+mu0  = slopeMin * r2 * driftShrink * volConf + sigMin * (volDeltaW * volDelta * volConf + structW * structScore)
+maxMu = maxDriftSig * sRem / T
+mu   = f_clamp(mu0, -maxMu, maxMu)
+
+// ---------------- Floor pivots (previous completed period, no repaint) ----------------
+[dH, dL, dC] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+[fH, fL, fC] = request.security(syminfo.tickerid, "240", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+[hH, hL, hC] = request.security(syminfo.tickerid, "60", [high[1], low[1], close[1]], lookahead=barmerge.lookahead_on)
+
+// ---------------- Levels ----------------
+var lvlP = array.new_float()
+var lvlB = array.new_float()
+var lvlN = array.new_string()
+
+f_add(p, b, n) =>
+    if not na(p) and p > 0 and b > 0
+        array.push(lvlP, p)
+        array.push(lvlB, b)
+        array.push(lvlN, n)
+
+f_addPivots(h, l, c, w, tf) =>
+    if not na(h) and not na(l) and not na(c)
+        p = (h + l + c) / 3
+        f_add(p, 0.12 * w, tf + " P")
+        f_add(2 * p - l, 0.16 * w, tf + " R1")
+        f_add(2 * p - h, 0.16 * w, tf + " S1")
+        f_add(p + (h - l), 0.18 * w, tf + " R2")
+        f_add(p - (h - l), 0.18 * w, tf + " S2")
+
+tol      = close * sigBar * 0.5
+momentum = f_clamp((math.abs(mu * T) / sRem) / maxDriftSig, 0.0, 1.0)
+
+// Hold probability of one level: base x touches x volume at level x momentum into it.
+f_hold(lp, base) =>
+    isRes = lp > close
+    int touches = 0
+    float tv = 0.0
+    for i = 0 to touchLen - 1
+        hit = isRes ? (high[i] >= lp - tol and close[i] < lp) : (low[i] <= lp + tol and close[i] > lp)
+        if hit
+            touches += 1
+            tv += volume[i]
+    vf = touches > 0 and avgVol > 0 ? f_clamp(math.sqrt(tv / touches / avgVol), 0.85, 1.25) : 1.0
+    h = base * levelStrength * (1 + 0.1 * math.min(touches, 4)) * vf
+    towards = (isRes and mu > 0) or (not isRes and mu < 0)
+    h := towards ? h * (1 - 0.4 * momentum) * (relVol > 1.5 ? 0.85 : 1.0) : h * (1 + 0.15 * momentum)
+    f_clamp(h, 0.0, maxHold)
+
+var line tLine = na
+var line rLine = na
+var line sLine = na
+var label rLab = na
+var label sLab = na
+var table tbl = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 20), border_width=1)
+
+if barstate.islast and not na(target)
+    array.clear(lvlP)
+    array.clear(lvlB)
+    array.clear(lvlN)
+    if useD
+        f_addPivots(dH, dL, dC, 1.0, "1D")
+    if use4h
+        f_addPivots(fH, fL, fC, 0.85, "4h")
+    if use1h
+        f_addPivots(hH, hL, hC, 0.7, "1h")
+    if usePrev15
+        f_add(prevHi, 0.12, "prev15 H")
+        f_add(prevLo, 0.12, "prev15 L")
+    if useSwings
+        f_add(shA, 0.14, "swing H")
+        f_add(shB, 0.14, "swing H")
+        f_add(shC, 0.14, "swing H")
+        f_add(slA, 0.14, "swing L")
+        f_add(slB, 0.14, "swing L")
+        f_add(slC, 0.14, "swing L")
+    if customLvl > 0
+        f_add(customLvl, customStr, "custom")
+
+    // Nearest level above and below price (within 4 sigma of the remaining move)
+    zone = 4 * sRem
+    float nR = na
+    float nS = na
+    n = array.size(lvlP)
+    if n > 0
+        for i = 0 to n - 1
+            p = array.get(lvlP, i)
+            d = math.log(p / close)
+            if math.abs(d) <= zone
+                if p > close and (na(nR) or p < nR)
+                    nR := p
+                if p < close and (na(nS) or p > nS)
+                    nS := p
+
+    // Cluster: all levels within clusterTol of the nearest one combine: hold = 1 - prod(1 - h)
+    clusterTol = math.max(close * 0.0005, 0.25 * sRem * close)
+    float keepR = 1.0
+    float keepS = 1.0
+    float wR = 0.0
+    float wS = 0.0
+    float pxR = 0.0
+    float pxS = 0.0
+    string nameR = ""
+    string nameS = ""
+    if n > 0
+        for i = 0 to n - 1
+            p = array.get(lvlP, i)
+            if not na(nR) and p >= nR and p - nR <= clusterTol
+                h = f_hold(p, array.get(lvlB, i))
+                keepR *= (1 - h)
+                wR += h
+                pxR += p * h
+                nameR := nameR + (nameR == "" ? "" : "+") + array.get(lvlN, i)
+            if not na(nS) and p <= nS and nS - p <= clusterTol
+                h = f_hold(p, array.get(lvlB, i))
+                keepS *= (1 - h)
+                wS += h
+                pxS += p * h
+                nameS := nameS + (nameS == "" ? "" : "+") + array.get(lvlN, i)
+    hR = f_clamp(1 - keepR, 0.0, maxHold)
+    hS = f_clamp(1 - keepS, 0.0, maxHold)
+    rPx = wR > 0 ? pxR / wR : nR
+    sPx = wS > 0 ? pxS / wS : nS
+
+    // ---------------- Probability ----------------
+    lnP = math.log(close)
+    lnK = math.log(target)
+    m   = lnP + mu * T
+    pVol   = 1 - f_ncdf((lnK - lnP) / sRem)
+    pDrift = 1 - f_ncdf((lnK - m) / sRem)
+    pA = pDrift
+    // Resistance above price reflects the upper tail back down
+    if not na(rPx) and hR > 0
+        lr = math.log(rPx)
+        pA -= hR * (lnK >= lr ? pDrift : 1 - f_ncdf((2 * lr - lnK - m) / sRem))
+    // Support below price reflects the lower tail back up
+    if not na(sPx) and hS > 0
+        ls = math.log(sPx)
+        pA += hS * (lnK <= ls ? f_ncdf((lnK - m) / sRem) : f_ncdf((2 * ls - lnK - m) / sRem))
+    pA := f_clamp(pA, 0.01, 0.99)
+    pB = 1 - pA
+
+    // ---------------- Display ----------------
+    mm = math.floor(secLeft / 60)
+    ss = math.floor(secLeft % 60)
+    tLeft = str.tostring(mm) + ":" + (ss < 10 ? "0" : "") + str.tostring(ss)
+    upCol = pA >= 0.5 ? color.lime : color.gray
+    dnCol = pB > 0.5 ? color.red : color.gray
+    table.cell(tbl, 0, 0, "Target", text_color=color.white)
+    table.cell(tbl, 1, 0, str.tostring(target, "#.##"), text_color=color.yellow)
+    table.cell(tbl, 0, 1, "Time left", text_color=color.white)
+    table.cell(tbl, 1, 1, tLeft, text_color=color.white)
+    table.cell(tbl, 0, 2, "P(close ABOVE)", text_color=color.white)
+    table.cell(tbl, 1, 2, str.tostring(pA * 100, "#.0") + "%", text_color=upCol)
+    table.cell(tbl, 0, 3, "P(close BELOW)", text_color=color.white)
+    table.cell(tbl, 1, 3, str.tostring(pB * 100, "#.0") + "%", text_color=dnCol)
+    table.cell(tbl, 0, 4, "vol only / +drift", text_color=color.silver)
+    table.cell(tbl, 1, 4, str.tostring(pVol * 100, "#.0") + "% / " + str.tostring(pDrift * 100, "#.0") + "%", text_color=color.silver)
+    table.cell(tbl, 0, 5, "1σ move left", text_color=color.silver)
+    table.cell(tbl, 1, 5, str.tostring(close * sRem, "#.##") + " (" + str.tostring(sRem * 100, "#.###") + "%)", text_color=color.silver)
+    table.cell(tbl, 0, 6, "Slope / R²", text_color=color.silver)
+    table.cell(tbl, 1, 6, str.tostring(slopeMin * 100, "#.####") + "%/m / " + str.tostring(r2, "#.##"), text_color=color.silver)
+    table.cell(tbl, 0, 7, "RelVol / Δvol", text_color=color.silver)
+    table.cell(tbl, 1, 7, str.tostring(relVol, "#.##") + "x / " + str.tostring(volDelta, "#.##"), text_color=color.silver)
+    table.cell(tbl, 0, 8, "Structure", text_color=color.silver)
+    table.cell(tbl, 1, 8, structTxt, text_color=color.silver)
+    table.cell(tbl, 0, 9, "R hold / S hold", text_color=color.silver)
+    table.cell(tbl, 1, 9, str.tostring(hR * 100, "#") + "% / " + str.tostring(hS * 100, "#") + "%", text_color=color.silver)
+
+    if drawLevels
+        line.delete(tLine)
+        line.delete(rLine)
+        line.delete(sLine)
+        label.delete(rLab)
+        label.delete(sLab)
+        tLine := line.new(bar_index - 15, target, bar_index + 5, target, color=color.yellow, width=2)
+        if not na(rPx)
+            rLine := line.new(bar_index - 15, rPx, bar_index + 5, rPx, color=color.red, style=line.style_dashed)
+            rLab := label.new(bar_index + 5, rPx, "R " + nameR + " hold " + str.tostring(hR * 100, "#") + "%", style=label.style_label_left, color=color.new(color.red, 70), textcolor=color.white, size=size.small)
+        if not na(sPx)
+            sLine := line.new(bar_index - 15, sPx, bar_index + 5, sPx, color=color.green, style=line.style_dashed)
+            sLab := label.new(bar_index + 5, sPx, "S " + nameS + " hold " + str.tostring(hS * 100, "#") + "%", style=label.style_label_left, color=color.new(color.green, 70), textcolor=color.white, size=size.small)
+
+plot(target, "Target", color=color.new(color.yellow, 40), style=plot.style_stepline)
